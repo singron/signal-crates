@@ -68,7 +68,7 @@ impl WaitTid {
     }
 
     pub fn wait_drop(arc: Arc<WaitTid>) -> Tid {
-        return arc.wait();
+        arc.wait()
     }
 }
 

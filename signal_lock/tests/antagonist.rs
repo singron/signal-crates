@@ -122,7 +122,7 @@ macro_rules! test_statics {
 fn test_impl<L: Lock<u64>>(statics: Statics<L>) {
     unsafe { setup_handler(libc::SIGUSR1, statics.handler) };
 
-    let small = cfg!(miri) || true;
+    let small = cfg!(miri);
     let n_lock_threads = if small { 3 } else { 24 };
     let n_rounds = if small { 100 } else { 1000000 };
     let n_signals = if small { 10 } else { 1000 };

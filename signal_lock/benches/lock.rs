@@ -40,7 +40,7 @@ fn spin_a_bit(a: &AtomicBool) -> u64 {
             return i;
         }
     }
-    return 100;
+    100
 }
 
 fn contend_lock_spin<L: Lock<u64>>(lock: &L, n: u64) -> u64 {

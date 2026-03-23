@@ -131,23 +131,22 @@ static ROOT: StaticRoot = StaticRoot::new();
 
 impl Root {
     /// Find a mapping that includes addr.
-    fn lookup_addr(&mut self, addr: usize) -> Option<&mut Box<Mapping>> {
+    fn lookup_addr(&mut self, addr: usize) -> Option<&mut Mapping> {
         let mut range = self.map.range_mut(..=addr);
         // Mappings can't overlap, so we only need to look at the immediately previous mapping.
         range.next_back()
             .filter(|(start, m)| addr >= **start && addr < **start+m.len)
-            .map(|(_, m)| m)
+            .map(|(_, m)| &mut **m)
     }
 
     /// Find a mapping that would overlap with (addr, len).
-    fn lookup_overlap(&self, addr: usize, len: usize) -> Option<&Box<Mapping>> {
+    fn lookup_overlap(&self, addr: usize, len: usize) -> Option<&Mapping> {
         let end_addr = addr+len-1;
         let mut range = self.map.range(..=end_addr);
         // Mappings can't overlap, so we only need to look at the immediately previous mapping.
-        let mapping = range.next_back()
+        range.next_back()
             .filter(|(start, m)| addr < **start+m.len && addr+len > **start)
-            .map(|(_, m)| m);
-        mapping
+            .map(|(_, m)| &**m)
     }
 }
 
@@ -439,7 +438,7 @@ mod tests {
 
     impl TestMmap {
         fn slice(&self) -> &[u8] {
-            return unsafe { std::slice::from_raw_parts(self.addr, self.len) };
+            unsafe { std::slice::from_raw_parts(self.addr, self.len) }
         }
     }
 
@@ -455,7 +454,7 @@ mod tests {
 
     /// Return a file-backed mmap where all bytes are 1.
     fn create_test_mmap(len: usize, prot: libc::c_int) -> TestMmap {
-        let memfd = unsafe { libc::memfd_create(b"test\0".as_ptr() as *const i8, libc::MFD_CLOEXEC) };
+        let memfd = unsafe { libc::memfd_create(c"test".as_ptr(), libc::MFD_CLOEXEC) };
         use std::io::Write;
         if memfd == -1 {
             let err = last_os_error();
