@@ -30,7 +30,7 @@ unsafe extern "C" fn signal_handler(_sig: libc::c_int) {
         Ok(g) => {
             write_stderr(b"Handling in signal handler\n");
             do_the_thing(&g);
-        },
+        }
         Err(SignalLockError::Recursive) =>
         // Tell our thread to do it as soon as it unlocks:
         {

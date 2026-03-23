@@ -1,11 +1,12 @@
-/// A fake signal implementation useful for miri and loom. User code can register a handler, send
-/// signals to a thread, and check for signal interruptions at certain points.
-///
-/// Since this is used in tests and the signals aren't real, it uses non-signal-safe functionality
-/// as long as it can't be interrupted by fake signals (e.g. Mutex, thread_local).
+//! A fake signal implementation useful for miri and loom. User code can register a handler, send
+//! signals to a thread, and check for signal interruptions at certain points.
+//!
+//! Since this is used in tests and the signals aren't real, it uses non-signal-safe functionality
+//! as long as it can't be interrupted by fake signals (e.g. Mutex, thread_local).
+
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::cell::RefCell;
 
 #[cfg(loom)]
 use loom::sync::{Arc, Mutex, atomic::AtomicBool};
@@ -90,7 +91,7 @@ static IS_SIGNALED_MAP: std::sync::LazyLock<Mutex<HashMap<Tid, Arc<AtomicBool>>>
 // 3. The borrow bookeeping isn't atomic at the instruction level. A signal can interrupt
 //    between the instruction that checks the value isn't borrowed and the instruction that marks
 //    the value as borrowed.
-// 
+//
 // All of these aren't problems with our fake signal implementation since the call to the signal
 // handler is visible to the optimizer.
 thread_local! {
