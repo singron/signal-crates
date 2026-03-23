@@ -1,0 +1,9 @@
+[package]
+name = "mmapcatch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+errno = "^0.3"
+libc = "^0.2.182"
+signal_lock = { version = "0.1.0", path = "../signal_lock" }

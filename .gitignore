@@ -1,0 +1,7 @@
+/target
+*.log
+# pcal creates .old files
+/tla/*.old
+/states
+# TLA+ toolbox directories
+*.toolbox

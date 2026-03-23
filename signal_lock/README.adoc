@@ -1,0 +1,103 @@
+:showtitle:
+:icons: font
+
+= signal_lock
+
+This crate implements signal safe locks. These are safe to use in signal
+handlers in the presence of synchronously and asynchronously generated signals.
+The locks detect reentrancy by the same thread and return an error instead of
+deadlocking. They also avoid all functionality that isn't async-signal-safe.
+
+These are not spin locks and have performance similar to std::sync::Mutex on
+some platforms. See <<performance>>.
+
+== Is this useful?
+
+If the signal handler is triggered on a thread while the lock is held, further
+attempts by that thread to take the lock will return an error. This limitation
+might be pointless for some usecases. Here are some cases where this is still
+useful:
+
+* You are interested in synchronously generated signals (e.g. SIGBUS, SIGSEGV)
+  that shouldn't be generated inside the critical section.
+* You want to avoid the cost of syscalls to block signals while taking a lock
+  (e.g. pthread_setmask). See <<performance>>.
+* You would like to optimistically perform a task immediately in a signal
+  handler if possible, but you are also OK deferring it until immediately after
+  a critical section. E.g. compared to the common pattern where a signal
+  handler merely sets an atomic variable that has to be checked by
+  non-signal-handler code, this can reduce the number of places that variable
+  needs to be checked to just after critical sections. See
+  xref:examples/optimistic_handler.rs[].
+* This is your best alternative to writing lock-free algorithms.
+
+== What's safe to use in signals?
+
+This crate avoids everything that's not async-signal-safe including:
+
+* Allocations
+* Thread Local Storage (TLS)
+* Panicking (uses TLS)
+* Checking `std::thread::panicking()` (uses TLS)
+
+Code in this crate that normally would panic instead either returns an error or
+prints a message to stderr and aborts. It's expected that this crate never
+aborts except in extremely degenerate scenarios.
+
+== Poisoning
+
+These locks don't implement poisoning. Detecting a panic in the drop of
+MutexGuard requires calling `std::thread::panicking()`, which uses TLS.
+
+== Is this code correct?
+
+You should be extremely skeptical. Locks and signal handlers are some of the
+trickiest bits of code to write, and I'm purporting to have tackled both!
+
+* There are TLA+ specifications in xref:../tla/[] that verify correctness in a
+  variety of configurations, although they assume sequential consistency.
+* There are https://github.com/tokio-rs/loom[loom] tests that check correctness
+  of many interleavings, including some allowed only on weak-memory
+  architectures. These pass even when run exhaustively with
+  LOOM_MAX_PREEMPTIONS unset.
+* There are https://github.com/rust-lang/miri[miri] tests to check unsafe code.
+* Loom and miri tests simulate signals since they aren't directly supported.
+* The trickiest atomic code has a simplified proof of correctness. See
+  xref:./src/pipe.rs[].
+
+== Are thread locals safe in signals?
+
+Generally (and according to POSIX) Thread Local Storage (TLS) is not
+async-signal-safe, so this crate does not use thread locals. In practice, TLS
+can sometimes be safe in certain situations on some platforms depending on ABI
+and linking modes. The biggest issue is that accessing a thread local may
+allocate. E.g. if this code is compiled into a dynamically loaded library and
+loaded after the current thread was spawned, then the thread local it accesses
+may have deferred allocation.
+
+Even if you ensure the TLS is pre-allocated, the type might not tolerate
+arbitrary reentrancy. Rust requires RefCell for mutable access to thread
+locals, but RefCell isn't written to communicate with a signal handler (e.g.
+https://doc.rust-lang.org/std/sync/atomic/fn.compiler_fence.html[compiler_fence],
+volatile, and/or atomics) so it could lead to unsoundness.
+
+[#performance]
+== Performance
+
+This crate has two lock implementations: FutexLock and PipeLock. The top level
+SignalLock wraps the best implementation available. Both have a user-mode fast
+path when uncontended. In that case, performance can be dominated by the call
+to get the thread id (gettid). On Linux with glibc < 2.42, this requires a
+syscall and can make an uncontended lock 6-7x slower than std::sync::Mutex. On
+glibc >= 2.42, there is a fast user-mode alternative that we will detect and
+use at runtime. The musl gettid is always fast. With a fast gettid, FutexLock
+is about 5% slower than std::sync::Mutex on an uncontended lock, and PipeLock
+is about 45% slower. Under contention, the locks vary depending on the specific
+workload.
+
+Both locks are unfair (like std::sync::Mutex). You may want to wrap accesses
+from non-signal-handlers with an additional mutex if you would like additional
+features.
+
+Benchmarks of FutexLock, PipeLock, and std::sync::Mutex are included in
+xref:benches/[] and run with `cargo bench`.

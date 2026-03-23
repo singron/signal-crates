@@ -1,0 +1,14 @@
+{
+    "rust-overlay": {
+        "branch": "master",
+        "description": "Pure and reproducible nix overlay of binary distributed rust toolchains",
+        "homepage": "",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "rev": "458eea8d905c609e9d889423e6b8a1c7bc2f792c",
+        "sha256": "0sq8qfg6di21ksq752yr9n94wjnn73wfm19zsi1qvisi7p1iaymb",
+        "type": "tarball",
+        "url": "https://github.com/oxalica/rust-overlay/archive/458eea8d905c609e9d889423e6b8a1c7bc2f792c.tar.gz",
+        "url_template": "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+    }
+}

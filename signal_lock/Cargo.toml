@@ -1,0 +1,28 @@
+[package]
+name = "signal_lock"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+errno = "^0.3"
+libc = "^0.2.182"
+
+[target.'cfg(all(target_os = "linux", target_env="gnu"))'.dependencies]
+ctor = { version = "0.6.3", default-features = false, features = ["proc_macro"]}
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }
+
+[target.'cfg(loom)'.dependencies]
+loom = { version = "0.7", features = ["checkpoint"]}
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[[bench]]
+name = "lock"
+harness = false
+
+[[test]]
+name = "fork"
+harness = false

@@ -1,0 +1,530 @@
+#![cfg(not(windows))]
+
+// TODO: need to use SignalLock rather than FutexLock
+#![cfg(target_os="linux")]
+
+use std::collections::BTreeMap;
+use std::process::abort;
+use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+use signal_lock::{SignalLock, SignalLockError, pipe::PipeNewError};
+
+pub use libc::c_int;
+
+//mod avl;
+
+struct Mapping {
+    start: usize,
+    len: usize,
+    // PROT_EXEC, PROT_READ, PROT_WRITE, PROT_NONE that was passed to mmap. These will be reused
+    // for anonymous replacement mappings.
+    mmap_prot: i32,
+    state: Arc<State>,
+}
+
+struct State {
+    err: AtomicBool,
+    // Address that triggered SIGBUS.
+    err_addr: AtomicUsize,
+    // Address of new anonymous mapping of 0-pages in response to SIGBUS.
+    fix_addr: AtomicUsize,
+}
+
+struct Root {
+    map: BTreeMap<usize, Box<Mapping>>,
+    cleanly_unlocked: bool,
+}
+
+// We essentially want OnceLock::get_or_try_init, but it's not stabalized.
+
+struct TryOnce {
+    init: AtomicBool,
+    lock: Mutex<()>,
+}
+
+impl TryOnce {
+    const fn new() -> TryOnce {
+        TryOnce {
+            init: AtomicBool::new(false),
+            lock: Mutex::new(()),
+        }
+    }
+
+    fn try_call<E, F: FnOnce() -> Result<(), E>>(&self, f: F) -> Result<(), E> {
+        if self.init.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _g = self.lock.lock().unwrap();
+        // This can be Relaxed since it's inside lock acquisition.
+        if self.init.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let res = f();
+        if res.is_ok() {
+            // This must be Release to synchronize with Acquire load outside lock.
+            self.init.store(true, Ordering::Release);
+        }
+        res
+    }
+
+    fn is_completed(&self) -> bool {
+        self.init.load(Ordering::Acquire)
+    }
+}
+
+/// This is very similar to LazyLock<Root> except initialization is fallible and retryable.
+struct StaticRoot {
+    // We should probably put something like this into signal_lock since
+    //   1. SignalLock::new isn't const
+    //   2. You probably need a static to communicate with your signal handler.
+    once: TryOnce,
+    root: UnsafeCell<MaybeUninit<SignalLock<Root>>>,
+}
+
+unsafe impl Sync for StaticRoot {}
+
+impl StaticRoot {
+    const fn new() -> StaticRoot {
+        StaticRoot { once: TryOnce::new(), root: UnsafeCell::new(MaybeUninit::uninit()) }
+    }
+
+    fn get(&self) -> Option<&SignalLock<Root>> {
+        if self.once.is_completed() {
+            // Safety: root is initialized and there are no &mut concurrent accesses.
+            Some(unsafe { &*(self.root.get() as *const _) })
+        } else {
+            None
+        }
+    }
+
+    fn init(&self) -> Result<(), PipeNewError> {
+        self.once.try_call(|| {
+            let ptr = self.root.get();
+            let lock = SignalLock::new(Root{map: BTreeMap::new(), cleanly_unlocked: true})?;
+            // Safety: ptr is valid and uninitialized and there are no concurrent accesses yet.
+            unsafe { (*ptr).write(lock) };
+            Ok(())
+        })
+    }
+
+    fn get_or_init(&self) -> Result<&SignalLock<Root>, PipeNewError> {
+        self.init()?;
+        Ok(self.get().unwrap())
+    }
+}
+
+impl Drop for StaticRoot {
+    fn drop(&mut self) {
+        if self.once.is_completed() {
+            // Safety: root is initialized, there are no concurrent accesses since we have &mut,
+            // and there won't be any future accesses.
+            unsafe {
+                self.root.get_mut().assume_init_drop()
+            };
+        }
+    }
+}
+
+static ROOT: StaticRoot = StaticRoot::new();
+
+impl Root {
+    /// Find a mapping that includes addr.
+    fn lookup_addr(&mut self, addr: usize) -> Option<&mut Box<Mapping>> {
+        let mut range = self.map.range_mut(..=addr);
+        // Mappings can't overlap, so we only need to look at the immediately previous mapping.
+        range.next_back()
+            .filter(|(start, m)| addr >= **start && addr < **start+m.len)
+            .map(|(_, m)| m)
+    }
+
+    /// Find a mapping that would overlap with (addr, len).
+    fn lookup_overlap(&self, addr: usize, len: usize) -> Option<&Box<Mapping>> {
+        let end_addr = addr+len-1;
+        let mut range = self.map.range(..=end_addr);
+        // Mappings can't overlap, so we only need to look at the immediately previous mapping.
+        let mapping = range.next_back()
+            .filter(|(start, m)| addr < **start+m.len && addr+len > **start)
+            .map(|(_, m)| m);
+        mapping
+    }
+}
+
+struct SigbusInfo {
+    addr: *mut libc::c_void,
+}
+
+#[cfg(target_os="linux")]
+fn parse_sigbus(info: &libc::siginfo_t) -> Option<SigbusInfo> {
+    // This guarentees that the signal was caused by an invalid memory access by this thread. E.g.
+    // it was not sent by kill(2) at an arbitrary point in the program, otherwise si_code would be
+    // SI_USER or another value.
+    if info.si_signo != libc::SIGBUS || info.si_code != libc::BUS_ADRERR {
+        return None;
+    }
+
+    // I believe si_addr is never 0 if the above is true, but just to be safe.
+    let addr = unsafe { info.si_addr() };
+    if addr.is_null() {
+        return None;
+    }
+
+    Some(SigbusInfo { addr })
+}
+
+// Wrap abort with functions so they appear as clues in the stack trace.
+
+#[inline(never)]
+fn abort_some_other_sigbus() -> ! {
+    abort();
+}
+
+#[inline(never)]
+fn abort_recursive_sigbus() -> ! {
+    abort();
+}
+
+/// Only call this from a non-signal-handler.
+fn with_root<T, F: FnOnce(&mut Root) -> T>(f: F) -> Result<T, PipeNewError> {
+    // SignalLock.lock() should always succeed from a non-signal handler unless the signal handler
+    // leaked its guard.
+    let mut g = ROOT.get_or_init()?.lock().unwrap();
+    if !g.cleanly_unlocked {
+        panic!("Root was poisoned");
+    }
+    g.cleanly_unlocked = false;
+    let res = f(&mut g);
+    g.cleanly_unlocked = true;
+    drop(g);
+    Ok(res)
+}
+
+#[derive(Debug)]
+pub enum RegisterError {
+    Overlap{addr: usize, len: usize},
+    PipeFailed(std::io::Error),
+    FcntlFailed(std::io::Error),
+}
+
+impl From<PipeNewError> for RegisterError {
+    fn from(value: PipeNewError) -> Self {
+        match value {
+            PipeNewError::PipeFailed(e) => RegisterError::FcntlFailed(e),
+            PipeNewError::FcntlFailed(e) => RegisterError::PipeFailed(e),
+        }
+    }
+}
+
+pub struct Guard {
+    addr: usize,
+    state: Arc<State>,
+}
+
+impl Guard {
+    /// If true, at least one access to this mapping caused SIGBUS as if the file was truncated,
+    /// and the problematic pages were replaced with 0-filled anonymous mappings.
+    pub fn is_err(&self) -> bool {
+        self.state.err.load(Ordering::SeqCst)
+    }
+
+    /// The address of the access that caused SIGBUS most recently.
+    pub fn err_addr(&self) -> usize {
+        self.state.err_addr.load(Ordering::SeqCst)
+    }
+
+    /// The address of the most recent anonymous mapping. This is typically the start of the page
+    /// of [Guard::err_addr].
+    pub fn fix_addr(&self) -> usize {
+        self.state.fix_addr.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let _ = with_root(|r| {
+            let mapping = r.map.remove(&self.addr).expect("addr in ROOT");
+            assert!(Arc::ptr_eq(&mapping.state, &self.state));
+            mapping
+        });
+        // Note we don't munmap our anonymous 0-pages here. If the caller calls munmap() with their
+        // original addr and length, they will also remove the 0-page maps.
+    }
+}
+
+static ONCE: std::sync::Once = std::sync::Once::new();
+
+fn install_signal_handler() {
+    ONCE.call_once(|| {
+        // Rust installs a SIGSEGV/SIGBUS handler to print a friendly message when the stack
+        // overflows:
+        // https://doc.rust-lang.org/src/std/sys/pal/unix/stack_overflow.rs.html
+        //
+        // If rust's handler doesn't detect a stack overflow, it unfortunately replaces the current
+        // handler with SIG_DFL (the default handler). This means that if we try to install a new
+        // handler that chain calls rust's handler (e.g. the behavior of the signal_hook_registry
+        // crate), the rust handler will uninstall the new handler instead.
+        //
+        // Additionally, the handler uses with_current_info, which can ocassionally cause other
+        // threads to deadlock.
+        //
+        // Therefore, we can't allow rust's SIGBUS handler to run.
+        let mut sa_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let res = unsafe{ libc::sigfillset(&mut sa_mask as *mut _) };
+        assert!(res != -1);
+
+        // On some platforms, this is the complete list of fields, so clippy complains.
+        #[allow(clippy::needless_update)]
+        let new = libc::sigaction{
+            sa_sigaction: handle_sigbus as *const() as usize,
+            sa_mask,
+            sa_flags: libc::SA_SIGINFO,
+            sa_restorer: None,
+            ..unsafe{std::mem::zeroed()}
+        };
+
+        let res = unsafe { libc::sigaction(libc::SIGBUS, &new, std::ptr::null_mut()) };
+        if res == -1 {
+            panic!("sigaction failed: {:?}", std::io::Error::last_os_error());
+        }
+    });
+}
+
+/// Register an existing file-backed memory map for graceful truncation. Normally, accessing the
+/// mmap of a truncated file will cause SIGBUS, but for a registered mmap, the SIGBUS will be
+/// caught and the offending section of the mmap will be replaced with an anonymous mapping with
+/// the given prot memory protection.
+///
+/// The returned Guard can report whether we caught SIGBUS for this mmap. When the Guard is
+/// dropped, the mmap is unregistered. The 0-pages are left in place so that the caller can call
+/// munmap(addr, len) without risk of unmapping unrelated mappings.
+///
+/// Additionally, other causes of SIGBUS might instead trigger abort() for the rest of the program
+/// even after all Guards are dropped.
+///
+/// This cannot detect accesses beyond the end of the file that are still within a valid page of
+/// the mmap since these won't trigger SIGBUS. If the file is lengthened after 0-pages have been
+/// mapped, the 0-pages will remain.
+///
+/// # Safety
+///   * addr and len must accurately describe a real mmap.
+///   * That map must outlive the returned Guard.
+///   * It must be safe for truncated pages to become 0-filled anonymous pages.
+pub unsafe fn register_mmap(addr: usize, len: usize, prot: c_int) -> Result<Guard, RegisterError> {
+    install_signal_handler();
+
+    with_root(|r| {
+        if let Some(overlap) = r.lookup_overlap(addr, len) {
+            return Err(RegisterError::Overlap {
+                addr: overlap.start,
+                len: overlap.len,
+            });
+        }
+        let state = Arc::new(State{
+            err: AtomicBool::new(false),
+            fix_addr: AtomicUsize::new(0),
+            err_addr: AtomicUsize::new(0),
+        });
+
+        r.map.insert(addr, Box::new(Mapping{
+            start: addr,
+            len,
+            state: state.clone(),
+            mmap_prot: prot,
+        }));
+
+        Ok(Guard{addr, state})
+    })?
+}
+
+struct SaveRestoreErrno {
+    errno: errno::Errno,
+}
+
+impl SaveRestoreErrno {
+    fn new() -> SaveRestoreErrno {
+        SaveRestoreErrno { errno: errno::errno() }
+    }
+}
+
+impl Drop for SaveRestoreErrno {
+    fn drop(&mut self) {
+        errno::set_errno(self.errno);
+    }
+}
+
+unsafe extern "C" fn handle_sigbus(_sig: libc::c_int, info: *const libc::siginfo_t, _ucontext: *const libc::c_void) {
+    // Safety: We better be called with a valid siginfo_t.
+    let info = unsafe{&*info};
+    let _e = SaveRestoreErrno::new();
+
+    // Panicking will often work and unwind until this extern "C" fn, but we shouldn't do it since
+    // it can call the allocator. A lot of the panic code also uses thread locals, which aren't
+    // necessarily safe in a signal handler.
+
+    let parsed = parse_sigbus(info);
+    if parsed.is_none() {
+        // This probably isn't a SIGBUS we can handle, but we can't ignore SIGBUS.
+        abort_some_other_sigbus();
+    }
+
+    // At this point, we know that the signal is due to a real invalid memory access in this
+    // thread. As long as this thread didn't generate this SIGBUS while holding the ROOT lock
+    // (extremely unlikely since it doesn't use mmaped files), we should be able to take that lock.
+    let SigbusInfo { addr } = parsed.unwrap();
+    // If ROOT isn't initialized, then there isn't a matching mapping.
+    let root = ROOT.get().unwrap_or_else(|| abort_some_other_sigbus());
+
+    let mut root = match root.lock() {
+        // Somehow we generated SIGBUS si_code=BUS_ADRERR while holding the lock.
+        Err(SignalLockError::Recursive) => abort_recursive_sigbus(),
+        Ok(r) => r,
+    };
+
+    let addr = addr as usize;
+    if let Some(mapping) = root.lookup_addr(addr) {
+        let system_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if system_page_size == -1 {
+            abort();
+        }
+        let system_page_size = system_page_size as usize;
+        if cfg!(debug_assertions) {
+            // This is a power of two everywhere.
+            if system_page_size.count_ones() != 1 {
+                abort();
+            }
+        }
+        // Calculate a page_aligned address to create a fixed 0 mmap.
+        let page_mask = !(system_page_size-1);
+        let fix_start = addr & page_mask;
+        if fix_start == 0 {
+            abort();
+        }
+        let fix_offset = fix_start - mapping.start;
+        let fix_len = mapping.len - (fix_offset);
+        let fix_prot = mapping.mmap_prot;
+        let fix_flags = libc::MAP_FIXED|libc::MAP_ANONYMOUS|libc::MAP_PRIVATE;
+        let res = unsafe { libc::mmap(fix_start as *mut libc::c_void, fix_len, fix_prot, fix_flags, -1, 0) };
+        if res == libc::MAP_FAILED {
+            abort();
+        }
+        if res as usize != fix_start {
+            abort();
+        }
+        let state = &mut mapping.state;
+        state.fix_addr.store(fix_start, Ordering::SeqCst);
+        state.err_addr.store(addr, Ordering::SeqCst);
+        state.err.store(true, Ordering::SeqCst);
+    } else {
+        abort_some_other_sigbus();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs::File, os::fd::FromRawFd};
+
+    use super::*;
+
+    struct TestMmap {
+        file: File,
+        addr: *mut u8,
+        len: usize,
+        prot: libc::c_int,
+    }
+
+    fn last_os_error() -> std::io::Error {
+        std::io::Error::last_os_error()
+    }
+
+    impl TestMmap {
+        fn slice(&self) -> &[u8] {
+            return unsafe { std::slice::from_raw_parts(self.addr, self.len) };
+        }
+    }
+
+    impl Drop for TestMmap {
+        fn drop(&mut self) {
+            let res = unsafe { libc::munmap(self.addr as *mut libc::c_void, self.len) };
+            if res == -1 {
+                let err = last_os_error();
+                panic!("munmap failed: {:?}", err);
+            }
+        }
+    }
+
+    /// Return a file-backed mmap where all bytes are 1.
+    fn create_test_mmap(len: usize, prot: libc::c_int) -> TestMmap {
+        let memfd = unsafe { libc::memfd_create(b"test\0".as_ptr() as *const i8, libc::MFD_CLOEXEC) };
+        use std::io::Write;
+        if memfd == -1 {
+            let err = last_os_error();
+            panic!("memfd_create failed: {:?}", err);
+        }
+        let mut file = unsafe { File::from_raw_fd(memfd) };
+        file.write_all(&vec![1u8; len]).unwrap();
+
+        let res = unsafe { libc::mmap(std::ptr::null_mut(), len, prot, libc::MAP_SHARED, memfd, 0) };
+        if res == libc::MAP_FAILED {
+            let err = last_os_error();
+            panic!("mmap failed: {:?}", err);
+        }
+        let addr = res as *mut u8;
+        TestMmap{
+            file,
+            len,
+            prot,
+            addr,
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn it_works() {
+        let t1 = create_test_mmap(2*4096, libc::PROT_READ);
+        let guard = unsafe { register_mmap(t1.addr as usize, t1.len, t1.prot).unwrap() };
+        t1.file.set_len(4096).unwrap();
+        assert!(!guard.is_err());
+        let mut sum = 0u64;
+        for v in t1.slice() {
+            sum += *v as u64;
+        }
+        // We only read 1 up until truncation, and then zeroes.
+        assert_eq!(4096, sum);
+        assert!(guard.is_err());
+        assert_eq!(guard.err_addr(), &t1.slice()[4096] as *const _ as usize);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn progressive_truncates() {
+        let t1 = create_test_mmap(3*4096, libc::PROT_READ);
+        let guard = unsafe { register_mmap(t1.addr as usize, t1.len, t1.prot).unwrap() };
+        let lengths = [2*4096, 4096, 0];
+        for len in lengths {
+            t1.file.set_len(len).unwrap();
+            let mut sum = 0u64;
+            for v in t1.slice() {
+                sum += *v as u64;
+            }
+            // We only read 1 up until truncation, and then zeroes.
+            assert_eq!(len, sum);
+            assert!(guard.is_err());
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn full_truncate() {
+        let t1 = create_test_mmap(2*4096, libc::PROT_READ);
+        let guard = unsafe { register_mmap(t1.addr as usize, t1.len, t1.prot).unwrap() };
+        t1.file.set_len(0).unwrap();
+        assert!(!guard.is_err());
+        let mut sum = 0u64;
+        for v in t1.slice() {
+            sum += *v as u64;
+        }
+        assert_eq!(0, sum);
+        assert!(guard.is_err());
+    }
+}
