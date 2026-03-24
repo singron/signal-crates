@@ -100,4 +100,4 @@ from non-signal-handlers with an additional mutex if you would like additional
 features.
 
 Benchmarks of FutexLock, PipeLock, and std::sync::Mutex are included in
-xref:benches/[] and run with `cargo bench`.
+xref:./benches/[] and run with `cargo bench`.
