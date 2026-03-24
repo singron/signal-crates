@@ -18,7 +18,7 @@ let
     stdenvPkgs.mkShell ({
       packages = [ (mkRust stdenvPkgs) ]
         # Avoid downloading packages from pkgsStatic if we can
-        ++ (with pkgs; [ niv gdb tlaplus ]);
+        ++ (with pkgs; [ niv gdb tlaplus asciidoctor git ]);
       passthru = {
         inherit stdShell staticShell miriShell freebsdShell;
       };

@@ -54,7 +54,7 @@ MutexGuard requires calling `std::thread::panicking()`, which uses TLS.
 You should be extremely skeptical. Locks and signal handlers are some of the
 trickiest bits of code to write, and I'm purporting to have tackled both!
 
-* There are TLA+ specifications in xref:../tla/[] that verify correctness in a
+* There are TLA+ specifications in `../tla/` that verify correctness in a
   variety of configurations, although they assume sequential consistency.
 * There are https://github.com/tokio-rs/loom[loom] tests that check correctness
   of many interleavings, including some allowed only on weak-memory
@@ -100,4 +100,4 @@ from non-signal-handlers with an additional mutex if you would like additional
 features.
 
 Benchmarks of FutexLock, PipeLock, and std::sync::Mutex are included in
-xref:./benches/[] and run with `cargo bench`.
+`./benches/` and run with `cargo bench`.

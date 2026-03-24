@@ -23,6 +23,8 @@ run() {
   nix-shell --pure --keep LOOM_MAX_PREEMPTIONS -A "$attr" --run "bash -x -c $escaped"
 }
 
+# `asciidoctor --out-file /dev/null` discards errors
+run stdShell 'set -o pipefail && git ls-files "*.adoc" -z | xargs -0 -n 1 asciidoctor --warnings --verbose --failure-level INFO --safe --out-file - > /dev/null'
 run stdShell 'cargo build --workspace --all-targets && RUSTFLAGS="--cfg loom" cargo build --release -p signal_lock --all-targets'
 run stdShell 'cargo test --workspace --all-targets && RUSTFLAGS="--cfg loom" cargo test --release -p signal_lock'
 
